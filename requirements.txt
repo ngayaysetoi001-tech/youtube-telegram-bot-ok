@@ -1,0 +1,5 @@
+python-telegram-bot[job-queue]
+feedparser
+httpx
+Flask
+xmltodict
