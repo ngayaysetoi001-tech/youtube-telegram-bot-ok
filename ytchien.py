@@ -51,7 +51,7 @@ JSONBIN_URL = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
 state_lock = asyncio.Lock()
 app = Flask(__name__)
 
-# --- CÁC HÀM CƠ BẢN (giữ nguyên) ---
+# --- CÁC HÀM CƠ BẢN ---
 async def load_state(client: httpx.AsyncClient):
     headers = {'X-Master-Key': JSONBIN_API_KEY}
     try:
@@ -93,7 +93,7 @@ async def start(update: Update, context: CallbackContext):
 async def help_command(update: Update, context: CallbackContext):
     await update.message.reply_text("Các lệnh có sẵn trong menu /.")
 
-# --- LOGIC MỚI ĐỂ XOAY VÒNG KEY ---
+# --- LOGIC XOAY VÒNG KEY ---
 def get_current_api_key():
     return API_KEY_LIST[current_api_key_index]
 
@@ -108,30 +108,26 @@ def rotate_api_key():
     return True
 
 async def make_youtube_api_request(client: httpx.AsyncClient, endpoint: str, params: dict):
-    """Hàm trung tâm để thực hiện các yêu cầu API và xử lý lỗi hết hạn ngạch."""
     base_url = "https://www.googleapis.com/youtube/v3/"
     params['key'] = get_current_api_key()
     
     try:
         response = await client.get(base_url + endpoint, params=params)
-        
-        # Kiểm tra lỗi hết hạn ngạch
         if response.status_code == 403:
             try:
                 error_data = response.json()
                 if any(err.get('reason') == 'quotaExceeded' for err in error_data.get('error', {}).get('errors', [])):
-                    if rotate_api_key(): # Nếu còn key khác để thử
-                        params['key'] = get_current_api_key() # Cập nhật key mới
-                        response = await client.get(base_url + endpoint, params=params) # Thử lại
+                    if rotate_api_key():
+                        params['key'] = get_current_api_key()
+                        response = await client.get(base_url + endpoint, params=params)
             except json.JSONDecodeError:
-                pass # Bỏ qua nếu response không phải là JSON
-                
+                pass
         return response
     except httpx.RequestError as e:
         logger.error(f"Lỗi mạng khi gọi YouTube API: {e}")
         return None
 
-# --- HÀM KIỂM TRA ĐƯỢC CẬP NHẬT ---
+# --- HÀM KIỂM TRA ---
 async def youtube_check_callback(context: CallbackContext):
     logger.info("Bắt đầu chu kỳ kiểm tra video mới...")
     if current_api_key_index >= len(API_KEY_LIST):
@@ -142,7 +138,6 @@ async def youtube_check_callback(context: CallbackContext):
         async with state_lock:
             state = await load_state(client)
             if state is None or not state.get("channels"): return
-
             something_changed = False
             for channel_id, data in state["channels"].items():
                 try:
@@ -160,7 +155,6 @@ async def youtube_check_callback(context: CallbackContext):
                     latest_video = api_data['items'][0]
                     video_id = latest_video['snippet']['resourceId']['videoId']
                     last_known_id = data.get("last_video_id")
-                    
                     published_at = datetime.fromisoformat(latest_video['snippet']['publishedAt'].replace('Z', '+00:00'))
                     now = datetime.now(timezone.utc)
                     
@@ -168,29 +162,22 @@ async def youtube_check_callback(context: CallbackContext):
                         channel_name = html.escape(data.get('name', latest_video['snippet']['channelTitle']))
                         video_title = html.escape(latest_video['snippet']['title'])
                         video_link = f"https://www.youtube.com/watch?v={video_id}"
-                        
-                        message = (f"📺 <b>{channel_name}</b> vừa ra video mới!\n\n"
-                                   f"<b>{video_title}</b>\n\n"
-                                   f'<a href="{video_link}">Xem ngay tại đây</a>')
-                                   
+                        message = (f"📺 <b>{channel_name}</b> vừa ra video mới!\n\n<b>{video_title}</b>\n\n<a href='{video_link}'>Xem ngay tại đây</a>")
                         await context.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode=ParseMode.HTML)
-                        
                         state["channels"][channel_id]["last_video_id"] = video_id
                         something_changed = True
                     elif last_known_id is None:
                         state["channels"][channel_id]["last_video_id"] = video_id
                         something_changed = True
-
                 except Exception as e:
                     logger.error(f"Lỗi khi xử lý kênh {data.get('name', 'N/A')}: {e}", exc_info=True)
-                
                 await asyncio.sleep(1)
 
             if something_changed:
                 await save_state(client, state)
     logger.info("Kết thúc chu kỳ kiểm tra.")
 
-# --- CÁC LỆNH COMMAND ĐƯỢC CẬP NHẬT ---
+# --- CÁC LỆNH COMMAND ---
 @restricted
 async def add_channel(update: Update, context: CallbackContext):
     if not context.args: await update.message.reply_text("Vui lòng nhập link kênh hoặc Channel ID."); return
@@ -200,10 +187,8 @@ async def add_channel(update: Update, context: CallbackContext):
             state = await load_state(client)
             if state is None: await update.message.reply_text("⚠️ Lỗi: Không thể kết nối DB."); return
             channel_id, final_url = None, None
-            if user_input.startswith("UC") and len(user_input) == 24:
-                channel_id, final_url = user_input, f"https://www.youtube.com/channel/{user_input}"
-            elif user_input.startswith("http"):
-                final_url, channel_id = user_input, await get_channel_id_from_url(client, user_input)
+            if user_input.startswith("UC") and len(user_input) == 24: channel_id, final_url = user_input, f"https://www.youtube.com/channel/{user_input}"
+            elif user_input.startswith("http"): final_url, channel_id = user_input, await get_channel_id_from_url(client, user_input)
             else: await update.message.reply_text("❌ Định dạng không hợp lệ."); return
             if not channel_id: await update.message.reply_text("❌ Không tìm thấy Channel ID từ link này."); return
             if channel_id in state["channels"]: await update.message.reply_text("✅ Kênh đã có trong danh sách."); return
@@ -229,13 +214,10 @@ async def remove_channel(update: Update, context: CallbackContext):
             state = await load_state(client)
             if state is None: await update.message.reply_text("⚠️ Lỗi: Không thể kết nối tới cơ sở dữ liệu."); return
             channel_id_to_remove = None
-            if user_input.startswith("UC") and len(user_input) == 24: channel_id_to_remove = user_input
-            elif user_input.startswith("http"):
-                for cid, data in state.get("channels", {}).items():
-                    if user_input == data.get("url"): channel_id_to_remove = cid; break
-            if not channel_id_to_remove: await update.message.reply_text("❌ Không tìm thấy kênh này trong danh sách của bạn."); return
+            for cid, data in state.get("channels", {}).items():
+                if user_input == cid or user_input == data.get("url"): channel_id_to_remove = cid; break
             
-            if channel_id_to_remove in state["channels"]:
+            if channel_id_to_remove:
                 channel_name = state["channels"][channel_id_to_remove].get('name', 'Kênh không rõ tên')
                 del state["channels"][channel_id_to_remove]
                 if await save_state(client, state):
@@ -244,10 +226,24 @@ async def remove_channel(update: Update, context: CallbackContext):
                 else: await update.message.reply_text("⚠️ Lỗi: Không thể lưu thay đổi.")
             else: await update.message.reply_text("❌ Không tìm thấy kênh này trong danh sách của bạn.")
 
+# --- SỬA LỖI: ĐIỀN LẠI NỘI DUNG CHO HÀM LIST_CHANNELS ---
 @restricted
 async def list_channels(update: Update, context: CallbackContext):
-    # Giữ nguyên
-    pass
+    async with httpx.AsyncClient() as client:
+        state = await load_state(client)
+        if state is None: 
+            await update.message.reply_text("⚠️ Lỗi: Không thể kết nối tới DB.")
+            return
+        if not state.get("channels"): 
+            await update.message.reply_text("Không có kênh nào trong danh sách.")
+            return
+        
+        message_parts = ["📜 <b>Các kênh đang được theo dõi:</b>\n"]
+        for i, (channel_id, data) in enumerate(state["channels"].items(), 1):
+            name, url = html.escape(data.get('name', 'N/A')), html.escape(data.get('url', '#'))
+            message_parts.append(f"<b>{i}. {name}</b>\n   - Link: {url}\n   - ID: <code>{channel_id}</code>\n")
+        
+        await update.message.reply_text("\n".join(message_parts), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 async def post_init(application: Application):
     await application.bot.set_my_commands([
@@ -262,8 +258,10 @@ def run_bot():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-    application.add_handler(CommandHandler("start", start)); application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("add", add_channel)); application.add_handler(CommandHandler("remove", remove_channel))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("add", add_channel))
+    application.add_handler(CommandHandler("remove", remove_channel))
     application.add_handler(CommandHandler("list", list_channels))
     job_queue = application.job_queue
     job_queue.run_repeating(youtube_check_callback, interval=CHECK_INTERVAL, first=10)
