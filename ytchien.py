@@ -10,7 +10,7 @@ from flask import Flask
 import html
 import sys
 
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, CallbackContext
 from telegram.constants import ParseMode
 from datetime import datetime, timedelta, timezone
@@ -32,7 +32,7 @@ if not all([BOT_TOKEN, CHAT_ID, ADMIN_USER_ID_STR, YOUTUBE_API_KEY]):
     sys.exit(1)
 
 ADMIN_USER_ID = int(ADMIN_USER_ID_STR)
-CHECK_INTERVAL = 60 # Có thể đặt 60 giây vì API rất rẻ
+CHECK_INTERVAL = 90 
 
 # --- CẤU HÌNH JSONBIN.IO ---
 JSONBIN_API_KEY = os.getenv('JSONBIN_API_KEY')
@@ -91,7 +91,7 @@ async def start(update: Update, context: CallbackContext):
     await update.message.reply_text("👋 Chào bạn! Tôi là bot thông báo video YouTube, phiên bản API hiệu suất cao.")
 
 async def help_command(update: Update, context: CallbackContext):
-    await update.message.reply_text("Các lệnh: /add, /remove, /list")
+    await update.message.reply_text("Các lệnh có sẵn trong menu /.")
 
 # --- HÀM KIỂM TRA ĐÃ TỐI ƯU ---
 async def youtube_check_callback(context: CallbackContext):
@@ -104,16 +104,10 @@ async def youtube_check_callback(context: CallbackContext):
             something_changed = False
             for channel_id, data in state["channels"].items():
                 try:
-                    # Chuyển đổi Channel ID thành Uploads Playlist ID
                     playlist_id = "UU" + channel_id[2:]
                     
                     api_url = "https://www.googleapis.com/youtube/v3/playlistItems"
-                    params = {
-                        'key': YOUTUBE_API_KEY,
-                        'playlistId': playlist_id,
-                        'part': 'snippet',
-                        'maxResults': 1
-                    }
+                    params = {'key': YOUTUBE_API_KEY, 'playlistId': playlist_id, 'part': 'snippet', 'maxResults': 1}
                     response = await client.get(api_url, params=params)
                     if response.status_code != 200:
                         logger.error(f"Lỗi API khi kiểm tra kênh {channel_id}: {response.text}")
@@ -126,12 +120,11 @@ async def youtube_check_callback(context: CallbackContext):
                     video_id = latest_video['snippet']['resourceId']['videoId']
                     last_known_id = data.get("last_video_id")
                     
-                    # Chỉ thông báo video mới đăng trong 1 ngày qua để tránh spam video cũ
                     published_at_str = latest_video['snippet']['publishedAt']
                     published_at = datetime.fromisoformat(published_at_str.replace('Z', '+00:00'))
                     now = datetime.now(timezone.utc)
                     
-                    if last_known_id != video_id and (now - published_at) < timedelta(days=1):
+                    if last_known_id != video_id and (now - published_at) < timedelta(days=2):
                         channel_name = html.escape(data.get('name', latest_video['snippet']['channelTitle']))
                         video_title = html.escape(latest_video['snippet']['title'])
                         video_link = f"https://www.youtube.com/watch?v={video_id}"
@@ -144,7 +137,6 @@ async def youtube_check_callback(context: CallbackContext):
                         
                         state["channels"][channel_id]["last_video_id"] = video_id
                         something_changed = True
-                    # Cập nhật ID lần đầu để làm mốc
                     elif last_known_id is None:
                         state["channels"][channel_id]["last_video_id"] = video_id
                         something_changed = True
@@ -171,8 +163,7 @@ async def add_channel(update: Update, context: CallbackContext):
             if user_input.startswith("UC") and len(user_input) == 24:
                 channel_id, final_url = user_input, f"https://www.youtube.com/channel/{user_input}"
             elif user_input.startswith("http"):
-                final_url = user_input
-                channel_id = await get_channel_id_from_url(client, user_input)
+                final_url, channel_id = user_input, await get_channel_id_from_url(client, user_input)
             else:
                 await update.message.reply_text("❌ Định dạng không hợp lệ."); return
             if not channel_id: await update.message.reply_text("❌ Không tìm thấy Channel ID từ link này."); return
@@ -192,30 +183,41 @@ async def add_channel(update: Update, context: CallbackContext):
 
 @restricted
 async def remove_channel(update: Update, context: CallbackContext):
-    # Giữ nguyên như phiên bản trước, đã hoạt động tốt
-    if not context.args: await update.message.reply_text("Vui lòng nhập link/ID cần xóa."); return
-    user_input = context.args[0]
+    if not context.args:
+        await update.message.reply_text("Vui lòng nhập link kênh hoặc Channel ID cần xóa.")
+        return
+        
+    user_input = context.args[0].strip()
+    
     async with httpx.AsyncClient() as client:
         async with state_lock:
-            state = await load_state(client);
-            if state is None: await update.message.reply_text("⚠️ Lỗi: Không thể kết nối DB."); return
+            state = await load_state(client)
+            if state is None:
+                await update.message.reply_text("⚠️ Lỗi: Không thể kết nối tới cơ sở dữ liệu.")
+                return
+
+            # --- SỬA LỖI: LOGIC XÓA KÊNH ỔN ĐỊNH HƠN ---
             channel_id_to_remove = None
-            if user_input.startswith("UC") and len(user_input) == 24: channel_id_to_remove = user_input
-            elif user_input.startswith("http"): channel_id_to_remove = await get_channel_id_from_url(client, user_input)
-            else: await update.message.reply_text("❌ Định dạng không hợp lệ."); return
-            if not channel_id_to_remove: await update.message.reply_text("❌ Không tìm thấy kênh."); return
-            if channel_id_to_remove in state["channels"]:
+            for cid, data in state.get("channels", {}).items():
+                # So sánh cả Channel ID và URL đã lưu
+                if user_input == cid or user_input == data.get("url"):
+                    channel_id_to_remove = cid
+                    break
+            
+            if channel_id_to_remove:
                 channel_name = state["channels"][channel_id_to_remove].get('name', 'Kênh không rõ tên')
                 del state["channels"][channel_id_to_remove]
+                
                 if await save_state(client, state):
                     safe_name = html.escape(channel_name)
                     await update.message.reply_text(f"🗑️ Đã xóa kênh: <b>{safe_name}</b>.", parse_mode=ParseMode.HTML)
-                else: await update.message.reply_text("⚠️ Lỗi: Không thể lưu thay đổi.")
-            else: await update.message.reply_text("Kênh này không có trong danh sách.")
+                else:
+                    await update.message.reply_text("⚠️ Lỗi: Không thể lưu thay đổi.")
+            else:
+                await update.message.reply_text("❌ Không tìm thấy kênh này trong danh sách của bạn.")
 
 @restricted
 async def list_channels(update: Update, context: CallbackContext):
-    # Giữ nguyên như phiên bản trước
     async with httpx.AsyncClient() as client:
         state = await load_state(client)
         if state is None: await update.message.reply_text("⚠️ Lỗi: Không thể kết nối tới DB."); return
@@ -226,10 +228,23 @@ async def list_channels(update: Update, context: CallbackContext):
             message_parts.append(f"<b>{i}. {name}</b>\n   - Link: {url}\n   - ID: <code>{channel_id}</code>\n")
         await update.message.reply_text("\n".join(message_parts), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
+# --- CẢI TIẾN: HÀM ĐỂ THIẾT LẬP CÁC NÚT LỆNH ---
+async def post_init(application: Application):
+    await application.bot.set_my_commands([
+        BotCommand("start", "Bắt đầu hội thoại"),
+        BotCommand("help", "Xem trợ giúp"),
+        BotCommand("list", "Xem danh sách kênh (Admin)"),
+        BotCommand("add", "Thêm kênh mới (Admin)"),
+        BotCommand("remove", "Xóa kênh (Admin)"),
+    ])
+
 def run_bot():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Sử dụng `post_init` để thiết lập các lệnh sau khi bot khởi tạo
+    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("add", add_channel))
@@ -247,12 +262,9 @@ def run_bot():
 def hello_world():
     return "Telegram bot (API Version) is running in the background!"
 
-def run_flask():
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
-
 if __name__ == "__main__":
-    logger.info("Khởi động luồng cho bot Telegram...")
+    logger.info("Khởi động ứng dụng...")
     bot_thread = threading.Thread(target=run_bot)
     bot_thread.daemon = True
     bot_thread.start()
-    run_flask()
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
