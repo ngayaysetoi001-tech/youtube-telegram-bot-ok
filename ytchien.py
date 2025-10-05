@@ -1,20 +1,18 @@
 import logging
-import feedparser
 import httpx
-import re
 import json
 import os
 import asyncio
 from functools import wraps
 import threading
-from flask import Flask, request, Response
+from flask import Flask
 import html
 import sys
-import xmltodict
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, CallbackContext
 from telegram.constants import ParseMode
+from datetime import datetime, timedelta, timezone
 
 # --- CẤU HÌNH LOGGING ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -25,14 +23,15 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 CHAT_ID = os.getenv('CHAT_ID')
 ADMIN_USER_ID_STR = os.getenv('ADMIN_USER_ID')
-CALLBACK_URL = os.getenv('RENDER_EXTERNAL_URL', 'https://your-app-name.onrender.com') + "/youtube_webhook"
+YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY') # BIẾN MỚI
 # ------------------------------------
 
-if not all([BOT_TOKEN, CHAT_ID, ADMIN_USER_ID_STR]):
-    logger.critical("LỖI: Thiếu biến môi trường bắt buộc: BOT_TOKEN, CHAT_ID, ADMIN_USER_ID")
+if not all([BOT_TOKEN, CHAT_ID, ADMIN_USER_ID_STR, YOUTUBE_API_KEY]):
+    logger.critical("LỖI: Thiếu một trong các biến môi trường bắt buộc!")
     sys.exit(1)
 
 ADMIN_USER_ID = int(ADMIN_USER_ID_STR)
+CHECK_INTERVAL = 120 # Đặt 2 phút một lần để không hết hạn ngạch API
 
 # --- CẤU HÌNH JSONBIN.IO ---
 JSONBIN_API_KEY = os.getenv('JSONBIN_API_KEY')
@@ -40,15 +39,11 @@ JSONBIN_BIN_ID = os.getenv('JSONBIN_BIN_ID')
 JSONBIN_URL = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
 # ------------------------------------
 
-HUB_URL = "https://pubsubhubbub.appspot.com/subscribe"
 state_lock = asyncio.Lock()
 app = Flask(__name__)
-
-# --- SỬA LỖI: BIẾN TOÀN CỤC ĐỂ GIAO TIẾP GIỮA CÁC LUỒNG ---
 application: Application = None
-bot_loop: asyncio.AbstractEventLoop = None
-# -----------------------------------------------------------
 
+# (Các hàm load_state, save_state, restricted, start, help giữ nguyên)
 async def load_state(client: httpx.AsyncClient):
     headers = {'X-Master-Key': JSONBIN_API_KEY}
     try:
@@ -71,17 +66,6 @@ async def save_state(client: httpx.AsyncClient, state):
         logger.error(f"Lỗi khi lưu trạng thái lên JSONBin: {e}")
         return False
 
-async def get_channel_id_from_url(client: httpx.AsyncClient, channel_url):
-    try:
-        response = await client.get(channel_url, timeout=15, follow_redirects=True)
-        response.raise_for_status()
-        match = re.search(r'"channelId":"(UC[A-Za-z0-9_-]{22})"', response.text)
-        if match: return match.group(1)
-        else: return None
-    except httpx.RequestError as e:
-        logger.error(f"Lỗi khi lấy Channel ID từ {channel_url}: {e}")
-        return None
-
 def restricted(func):
     @wraps(func)
     async def wrapped(update: Update, context: CallbackContext, *args, **kwargs):
@@ -93,67 +77,85 @@ def restricted(func):
     return wrapped
 
 async def start(update: Update, context: CallbackContext):
-    await update.message.reply_text("👋 Chào bạn! Tôi là bot thông báo video YouTube, phiên bản Webhook tốc độ cao.")
+    await update.message.reply_text("👋 Chào bạn! Tôi là bot thông báo video YouTube, phiên bản YouTube Data API.")
 
 async def help_command(update: Update, context: CallbackContext):
-    await update.message.reply_text("Các lệnh: /add, /remove, /list, /resubscribeall")
+    await update.message.reply_text("Các lệnh: /add, /remove, /list")
 
-async def manage_subscription(channel_id: str, mode: str = "subscribe"):
-    topic_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
-    data = {'hub.mode': mode, 'hub.topic': topic_url, 'hub.callback': CALLBACK_URL, 'hub.verify': 'async', 'hub.lease_seconds': 432000}
+# --- HÀM KIỂM TRA MỚI SỬ DỤNG YOUTUBE DATA API ---
+async def youtube_check_callback(context: CallbackContext):
+    logger.info("Bắt đầu chu kỳ kiểm tra video mới bằng YouTube API...")
     async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(HUB_URL, data=data)
-            if 200 <= response.status_code < 300:
-                logger.info(f"Yêu cầu '{mode}' cho kênh {channel_id} đã được gửi thành công.")
-                return True
-            else:
-                logger.error(f"Lỗi khi gửi yêu cầu '{mode}' cho kênh {channel_id}. Status: {response.status_code}, Body: {response.text}")
-                return False
-        except httpx.RequestError as e:
-            logger.error(f"Lỗi mạng khi gửi yêu cầu '{mode}': {e}")
-            return False
+        async with state_lock:
+            state = await load_state(client)
+            if state is None or not state.get("channels"):
+                logger.info("Danh sách kênh trống, bỏ qua.")
+                return
 
-async def process_notification(xml_data: bytes):
-    logger.info("Đã nhận được thông báo từ Hub.")
-    try:
-        data = xmltodict.parse(xml_data)
-        entry = data.get('feed', {}).get('entry')
-        if not entry: return
-        video_id, channel_id = entry.get('yt:videoId'), entry.get('yt:channelId')
-        if not video_id or not channel_id: return
-            
-        async with httpx.AsyncClient() as client:
-            async with state_lock:
-                state = await load_state(client)
-                if state is None or channel_id not in state.get("channels", {}): return
-                last_known_id = state["channels"][channel_id].get("last_video_id")
-                if last_known_id != video_id:
-                    logger.info(f"Phát hiện video mới {video_id} cho kênh {channel_id}.")
-                    channel_name = html.escape(state["channels"][channel_id].get('name', entry.get('author', {}).get('name')))
-                    video_title, video_link = html.escape(entry.get('title')), entry.get('link', {}).get('@href')
-                    message = (f"📺 <b>{channel_name}</b> vừa ra video mới!\n\n<b>{video_title}</b>\n\n<a href='{video_link}'>Xem ngay tại đây</a>")
-                    await application.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode=ParseMode.HTML)
-                    state["channels"][channel_id]["last_video_id"] = video_id
-                    await save_state(client, state)
-    except Exception as e:
-        logger.error(f"Lỗi nghiêm trọng khi xử lý thông báo: {e}", exc_info=True)
+            something_changed = False
+            for channel_id, data in state["channels"].items():
+                try:
+                    # Gọi API của YouTube để tìm video mới nhất
+                    api_url = "https://www.googleapis.com/youtube/v3/search"
+                    params = {
+                        'key': YOUTUBE_API_KEY,
+                        'channelId': channel_id,
+                        'part': 'snippet',
+                        'order': 'date',
+                        'maxResults': 1,
+                        'type': 'video'
+                    }
+                    response = await client.get(api_url, params=params)
+                    if response.status_code != 200:
+                        logger.error(f"Lỗi API khi kiểm tra kênh {channel_id}: {response.text}")
+                        continue
 
-@app.route('/youtube_webhook', methods=['GET', 'POST'])
-def webhook_endpoint():
-    if request.method == 'GET':
-        challenge = request.args.get('hub.challenge')
-        if challenge:
-            logger.info("Xác thực webhook thành công với Hub.")
-            return Response(challenge, status=200, mimetype='text/plain')
-        return Response("No challenge", status=400, mimetype='text/plain')
-    elif request.method == 'POST':
-        # --- SỬA LỖI: SỬ DỤNG PHƯƠNG THỨC AN TOÀN ĐỂ GỬI TÁC VỤ ---
-        if bot_loop:
-            asyncio.run_coroutine_threadsafe(process_notification(request.data), bot_loop)
-        # -----------------------------------------------------------
-        return Response("OK", status=200)
+                    api_data = response.json()
+                    if not api_data.get('items'):
+                        continue
+                    
+                    latest_video = api_data['items'][0]
+                    video_id = latest_video['id']['videoId']
+                    last_known_id = data.get("last_video_id")
+                    
+                    # Chỉ thông báo video được đăng trong vòng 1 giờ qua để tránh thông báo video cũ
+                    published_at_str = latest_video['snippet']['publishedAt']
+                    published_at = datetime.fromisoformat(published_at_str.replace('Z', '+00:00'))
+                    now = datetime.now(timezone.utc)
+                    
+                    if last_known_id != video_id and (now - published_at) < timedelta(hours=1):
+                        channel_name = html.escape(data.get('name', latest_video['snippet']['channelTitle']))
+                        video_title = html.escape(latest_video['snippet']['title'])
+                        video_link = f"https://www.youtube.com/watch?v={video_id}"
+                        
+                        message = (f"📺 <b>{channel_name}</b> vừa ra video mới!\n\n"
+                                   f"<b>{video_title}</b>\n\n"
+                                   f'<a href="{video_link}">Xem ngay tại đây</a>')
+                                   
+                        await context.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode=ParseMode.HTML)
+                        
+                        state["channels"][channel_id]["last_video_id"] = video_id
+                        something_changed = True
+                    elif last_known_id is None: # Lần đầu kiểm tra, chỉ cập nhật
+                        state["channels"][channel_id]["last_video_id"] = video_id
+                        something_changed = True
 
+                except Exception as e:
+                    logger.error(f"Lỗi khi xử lý kênh {data.get('name', 'N/A')}: {e}", exc_info=True)
+                
+                await asyncio.sleep(1)
+
+            if something_changed:
+                await save_state(client, state)
+    logger.info("Kết thúc chu kỳ kiểm tra.")
+
+# --- CÁC HÀM CŨ ĐÃ CẬP NHẬT ---
+# (Các hàm add, remove, list sẽ không cần thay đổi nhiều)
+
+# ... (Dán các hàm add_channel, remove_channel, list_channels từ phiên bản trước vào đây,
+# chúng vẫn hoạt động tốt, chỉ cần xóa logic manage_subscription đi) ...
+
+# Đây là các hàm đã chỉnh sửa:
 @restricted
 async def add_channel(update: Update, context: CallbackContext):
     if not context.args: await update.message.reply_text("Vui lòng nhập link kênh hoặc Channel ID."); return
@@ -163,56 +165,46 @@ async def add_channel(update: Update, context: CallbackContext):
             state = await load_state(client)
             if state is None: await update.message.reply_text("⚠️ Lỗi: Không thể kết nối DB."); return
             channel_id, final_url = None, None
+            # Tạm thời dùng API để lấy tên kênh thay vì feedparser
             if user_input.startswith("UC") and len(user_input) == 24: channel_id, final_url = user_input, f"https://www.youtube.com/channel/{user_input}"
-            elif user_input.startswith("http"): final_url, channel_id = user_input, await get_channel_id_from_url(client, user_input)
-            else: await update.message.reply_text("❌ Định dạng không hợp lệ."); return
+            elif user_input.startswith("http"): 
+                 await update.message.reply_text("Chức năng thêm bằng link chưa được hỗ trợ trong phiên bản này, vui lòng nhập Channel ID (bắt đầu bằng UC...)."); return
+            else: await update.message.reply_text("❌ Định dạng không hợp lệ, vui lòng nhập Channel ID."); return
             if not channel_id: await update.message.reply_text("❌ Không tìm thấy Channel ID."); return
             if channel_id in state["channels"]: await update.message.reply_text("✅ Kênh đã có trong danh sách."); return
-            feed = await asyncio.to_thread(feedparser.parse, f'https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}')
-            channel_name = feed.feed.get('title', "Tên không xác định")
+            
+            # Lấy tên kênh từ API
+            api_url = f"https://www.googleapis.com/youtube/v3/channels?part=snippet&id={channel_id}&key={YOUTUBE_API_KEY}"
+            response = await client.get(api_url)
+            channel_name = "Tên không xác định"
+            if response.status_code == 200 and response.json().get('items'):
+                channel_name = response.json()['items'][0]['snippet']['title']
+            
             state["channels"][channel_id] = {"url": final_url, "name": channel_name, "last_video_id": None}
             if await save_state(client, state):
                 safe_name = html.escape(channel_name)
-                await update.message.reply_text(f"✅ Đã thêm kênh: <b>{safe_name}</b>. Đang đăng ký nhận thông báo...", parse_mode=ParseMode.HTML)
-                if await manage_subscription(channel_id, "subscribe"): await update.message.reply_text(f"✅ Đăng ký cho <b>{safe_name}</b> thành công!", parse_mode=ParseMode.HTML)
-                else: await update.message.reply_text(f"⚠️ Lỗi khi đăng ký cho <b>{safe_name}</b>.", parse_mode=ParseMode.HTML)
+                await update.message.reply_text(f"✅ Đã thêm kênh: <b>{safe_name}</b>.", parse_mode=ParseMode.HTML)
             else: await update.message.reply_text("⚠️ Lỗi: Không thể lưu thay đổi.")
+
 
 @restricted
 async def remove_channel(update: Update, context: CallbackContext):
-    if not context.args: await update.message.reply_text("Vui lòng nhập link/ID cần xóa."); return
-    user_input = context.args[0]
+    if not context.args: await update.message.reply_text("Vui lòng nhập Channel ID cần xóa."); return
+    channel_id_to_remove = context.args[0]
     async with httpx.AsyncClient() as client:
         async with state_lock:
-            state = await load_state(client)
+            state = await load_state(client);
             if state is None: await update.message.reply_text("⚠️ Lỗi: Không thể kết nối DB."); return
-            channel_id_to_remove = None
-            if user_input.startswith("UC") and len(user_input) == 24: channel_id_to_remove = user_input
-            elif user_input.startswith("http"): channel_id_to_remove = await get_channel_id_from_url(client, user_input)
-            else: await update.message.reply_text("❌ Định dạng không hợp lệ."); return
-            if not channel_id_to_remove: await update.message.reply_text("❌ Không tìm thấy kênh."); return
+            if not channel_id_to_remove.startswith("UC"): await update.message.reply_text("❌ Vui lòng nhập Channel ID hợp lệ."); return
+            
             if channel_id_to_remove in state["channels"]:
                 channel_name = state["channels"][channel_id_to_remove].get('name', 'Kênh không rõ tên')
                 del state["channels"][channel_id_to_remove]
                 if await save_state(client, state):
                     safe_name = html.escape(channel_name)
                     await update.message.reply_text(f"🗑️ Đã xóa kênh: <b>{safe_name}</b>.", parse_mode=ParseMode.HTML)
-                    await manage_subscription(channel_id_to_remove, "unsubscribe")
                 else: await update.message.reply_text("⚠️ Lỗi: Không thể lưu thay đổi.")
             else: await update.message.reply_text("Kênh này không có trong danh sách.")
-
-@restricted
-async def resubscribeall(update: Update, context: CallbackContext):
-    await update.message.reply_text("Bắt đầu quá trình đăng ký lại cho tất cả các kênh...")
-    async with httpx.AsyncClient() as client:
-        state = await load_state(client)
-        if state is None or not state.get("channels"): await update.message.reply_text("Không có kênh nào."); return
-        success_count, fail_count = 0, 0
-        for channel_id in state["channels"]:
-            if await manage_subscription(channel_id, "subscribe"): success_count += 1
-            else: fail_count += 1
-            await asyncio.sleep(1)
-    await update.message.reply_text(f"Hoàn tất! Thành công: {success_count}, thất bại: {fail_count}.")
 
 @restricted
 async def list_channels(update: Update, context: CallbackContext):
@@ -226,21 +218,32 @@ async def list_channels(update: Update, context: CallbackContext):
             message_parts.append(f"<b>{i}. {name}</b>\n   - Link: {url}\n   - ID: <code>{channel_id}</code>\n")
         await update.message.reply_text("\n".join(message_parts), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
+
 def run_bot():
-    global application, bot_loop
-    # --- SỬA LỖI: LƯU LẠI EVENT LOOP CỦA BOT ---
-    bot_loop = asyncio.new_event_loop()
-    # -------------------------------------------
-    asyncio.set_event_loop(bot_loop)
+    global application
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("add", add_channel))
     application.add_handler(CommandHandler("remove", remove_channel))
     application.add_handler(CommandHandler("list", list_channels))
-    application.add_handler(CommandHandler("resubscribeall", resubscribeall))
+    
+    # KÍCH HOẠT LẠI JOBQUEUE
+    job_queue = application.job_queue
+    job_queue.run_repeating(youtube_check_callback, interval=CHECK_INTERVAL, first=10)
+    
     logger.info("Bot Telegram đã khởi động và đang chạy...")
     application.run_polling(stop_signals=None)
+
+# --- PHẦN KHỞI ĐỘNG CHÍNH ---
+@app.route('/')
+def hello_world():
+    return "Telegram bot (API Version) is running in the background!"
+
+def run_flask():
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
 
 if __name__ == "__main__":
     if not all([JSONBIN_API_KEY, JSONBIN_BIN_ID]):
@@ -250,4 +253,4 @@ if __name__ == "__main__":
         bot_thread = threading.Thread(target=run_bot)
         bot_thread.daemon = True
         bot_thread.start()
-        app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+        run_flask()
